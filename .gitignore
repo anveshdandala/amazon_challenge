@@ -1,6 +1,8 @@
 .venv/
 __MACOSX/
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Local datasets
 student_resource/dataset/
