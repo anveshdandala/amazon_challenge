@@ -1,0 +1,9 @@
+.venv/
+__MACOSX/
+.DS_Store
+
+# Local datasets
+student_resource/dataset/
+
+# Generated results
+output/
