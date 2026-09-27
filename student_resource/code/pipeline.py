@@ -9,15 +9,56 @@ import pandas as pd
 from blocking import prepare_blocking_columns
 from indexing import build_token_index, filter_rare_tokens
 from normalization import normalize_dataframe
+from blocking_vectorized import build_candidates_fast
+
+SOURCE_DTYPES = {
+	"entity_id": str,
+	"business_name": str,
+	"business_address": str,
+	"country": str,
+}
 
 
 def load_source(path: Path, row_limit: int | None = None) -> pd.DataFrame:
-	return pd.read_csv(
-		path,
-		sep="\t",
-		dtype={"entity_id": str},
-		nrows=row_limit,
-	)
+	"""Load a TSV source table efficiently at scale.
+
+	Uses Polars scan_csv for multi-threaded lazy reading of multi-million
+	row files, falling back to PyArrow-backed pandas or fixed-dtype pandas.
+	"""
+	try:
+		import polars as pl
+
+		lazy_df = pl.scan_csv(
+			path,
+			separator="\t",
+			schema_overrides={
+				"entity_id": pl.String,
+				"business_name": pl.String,
+				"business_address": pl.String,
+				"country": pl.String,
+			},
+			null_values=[""],
+			truncate_ragged_lines=True,
+		)
+		if row_limit is not None:
+			lazy_df = lazy_df.limit(row_limit)
+		return lazy_df.collect().to_pandas()
+	except Exception:
+		try:
+			return pd.read_csv(
+				path,
+				sep="\t",
+				dtype=SOURCE_DTYPES,
+				engine="pyarrow",
+				nrows=row_limit,
+			)
+		except Exception:
+			return pd.read_csv(
+				path,
+				sep="\t",
+				dtype=SOURCE_DTYPES,
+				nrows=row_limit,
+			)
 
 
 def build_candidates(
@@ -25,22 +66,24 @@ def build_candidates(
 	source23: pd.DataFrame,
 	max_token_frequency: int = 200,
 ) -> dict[str, set[str]]:
-	name_index = filter_rare_tokens(
-		build_token_index(source23, "name_tokens"), max_token_frequency
-	)
-	address_index = filter_rare_tokens(
-		build_token_index(source23, "address_tokens"), max_token_frequency
-	)
+	# name_index = filter_rare_tokens(
+	# 	build_token_index(source23, "name_tokens"), max_token_frequency
+	# )
+	# address_index = filter_rare_tokens(
+	# 	build_token_index(source23, "address_tokens"), max_token_frequency
+	# )
 
-	candidates: dict[str, set[str]] = {}
-	for _, row in source1.iterrows():
-		entity_ids: set[str] = set()
-		for token in row["name_tokens"]:
-			entity_ids.update(name_index.get(token, set()))
-		for token in row["address_tokens"]:
-			entity_ids.update(address_index.get(token, set()))
-		candidates[row["entity_id"]] = entity_ids
-
+	
+	
+	# for _, row in source1.iterrows():
+	# 	entity_ids: set[str] = set()
+	# 	for token in row["name_tokens"]:
+	# 		entity_ids.update(name_index.get(token, set()))
+	# 	for token in row["address_tokens"]:
+	# 		entity_ids.update(address_index.get(token, set()))
+	# 	candidates[row["entity_id"]] = entity_ids
+	
+	candidates = build_candidates_fast(source1, source23, max_token_frequency=max_token_frequency)
 	return candidates
 
 
@@ -136,60 +179,61 @@ def write_results(
 
 
 def run_pipeline(
-    source1_path: Path,
-    source2_path: Path,
-    source3_path: Path,
-    output_dir: Path,
-    max_token_frequency: int = 200,
+	source1_path: Path,
+	source2_path: Path,
+	source3_path: Path,
+	output_dir: Path,
+	max_token_frequency: int = 200,
+	sample: int | None = None,
 ) -> None:
+	source1 = load_source(source1_path, row_limit=sample)
+	source2 = load_source(source2_path, row_limit=sample)
+	source3 = load_source(source3_path, row_limit=sample)
 
-	# TEMPORARY TEST
-	source1 = load_source(source1_path, row_limit=1000)
-	source2 = load_source(source2_path, row_limit=10000)
-	source3 = load_source(source3_path, row_limit=10000)
-
-    # Normalize only the rows we are testing
 	source1 = prepare_blocking_columns(
-        normalize_dataframe(source1)
-    )
-	
+		normalize_dataframe(source1)
+	)
 	source2 = prepare_blocking_columns(
-        normalize_dataframe(source2)
-    )
-	
+		normalize_dataframe(source2)
+	)
 	source3 = prepare_blocking_columns(
-        normalize_dataframe(source3)
-    )
-	
+		normalize_dataframe(source3)
+	)
 	source23 = pd.concat(
-        [source2, source3],
-        ignore_index=True,
-    )
+		[source2, source3],
+		ignore_index=True,
+	)
 	candidates = build_candidates(
-        source1,
-        source23,
-        max_token_frequency,
-    )
-
+		source1,
+		source23,
+		max_token_frequency,
+	)
 	matches = select_matches(
-        source1,
-        source23,
-        candidates,
-    )
-
+		source1,
+		source23,
+		candidates,
+	)
 	write_results(
-        output_dir,
-        source1,
-        candidates,
-        matches,
-    )
+		output_dir,
+		source1,
+		candidates,
+		matches,
+	)
 
-    
+
 def main() -> None:
 	parser = argparse.ArgumentParser(description="Run the entity-resolution pipeline.")
 	parser.add_argument("--data-dir", type=Path, default=Path("dataset/test"))
 	parser.add_argument("--output-dir", type=Path, default=Path("output"))
 	parser.add_argument("--max-token-frequency", type=int, default=200)
+	parser.add_argument(
+		"--sample",
+		type=int,
+		nargs="?",
+		const=1000,
+		default=None,
+		help="Sample row limit per source for fast local iteration (default: None for full data)",
+	)
 	args = parser.parse_args()
 
 	run_pipeline(
@@ -198,8 +242,10 @@ def main() -> None:
 		args.data_dir / "test_source3.tsv",
 		args.output_dir,
 		args.max_token_frequency,
+		sample=args.sample,
 	)
 
 
 if __name__ == "__main__":
 	main()
+
